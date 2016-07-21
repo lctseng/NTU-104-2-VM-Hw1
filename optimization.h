@@ -55,7 +55,7 @@ inline void insert_unresolved_eip(CPUState *env, target_ulong next_eip, unsigned
 unsigned long lookup_shadow_ret_addr(CPUState *env, target_ulong pc);
 void push_shack(CPUState *env, TCGv_ptr cpu_env, target_ulong next_eip);
 void pop_shack(TCGv_ptr cpu_env, TCGv next_eip);
-struct shadow_pair* get_shadow_pair_head_from_hash(CPUState *env, target_ulong guest_eip);
+struct shadow_pair** get_shadow_pair_head_from_hash(CPUState *env, target_ulong guest_eip);
 
 /*
  * Indirect Branch Target Cache
