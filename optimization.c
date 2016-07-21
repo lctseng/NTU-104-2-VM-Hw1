@@ -16,6 +16,7 @@
 
 extern uint8_t *optimization_ret_addr;
 
+
 /*
  * Shadow Stack
  */
@@ -105,27 +106,25 @@ unsigned long lookup_shadow_ret_addr(CPUState *env, target_ulong pc){
  */
 void helper_shack_flush(CPUState *env)
 {
+    int i;
+    // clean the hash
+    for(i=0;i< (2 << SHACK_INDEX_BITS);i++){
+        // get head
+        struct shadow_pair* sp = ((struct shadow_pair**)env->shadow_hash_list)[i];
+        // delete the head
+        while( sp->l.next){ // has next (not the ending one)
+            struct shadow_pair* next_sp = list_entry(sp->l.next, struct shadow_pair, l);
+            free(sp);
+            // go to next
+            sp  = next_sp;
+        }
+        // here, sp will be the last
+        sp->l.prev = NULL;
+        ((struct shadow_pair**)env->shadow_hash_list)[i] = sp;
+    }
 }
 
 void insert_unresolved_eip(CPUState *env, target_ulong next_eip, unsigned long *slot){
-    /*
-    // check duplicate
-    static int count = 0;
-    {
-        struct shadow_pair *sp = get_shadow_pair_head_from_hash(env, next_eip);
-        // search the head
-        int current_count = 0;
-        while( sp->l.next){ // has next (not the ending one)
-            if(sp->guest_eip == next_eip){
-                ++current_count;
-                ++count;
-            }
-            // go to next
-            sp = list_entry(sp->l.next, struct shadow_pair, l);
-        }
-        fprintf(stderr,"duplicate guest eip count: %d, total count: %d\n", current_count ,count);
-    }
-    */
     struct shadow_pair* sp = (struct shadow_pair*)malloc(sizeof(struct shadow_pair));
     struct shadow_pair** old_sp_ptr = get_shadow_pair_head_from_hash(env, next_eip);
     sp->guest_eip = next_eip;
@@ -134,6 +133,25 @@ void insert_unresolved_eip(CPUState *env, target_ulong next_eip, unsigned long *
     sp->l.next = &((*old_sp_ptr)->l);
     (*old_sp_ptr)->l.prev = &sp->l;
     *old_sp_ptr = sp;
+}
+
+
+// this helper does:
+// - check if can find from hash
+// - if not, push an entry
+void helper_shack_push(CPUState *env, target_ulong guest_eip){
+    unsigned long *slot = &env->shadow_ret_addr[env->shack_top - env->shack];
+    // check if we need to translate this addr?
+    unsigned long host_eip = lookup_shadow_ret_addr(env, guest_eip);
+    if(host_eip > 0){
+        // just add the result into slot
+        *slot = host_eip;
+    }
+    else{
+        // insert unresolved eip
+        *slot = 0;
+        insert_unresolved_eip(env, guest_eip, slot);
+    }
 }
 
 /*
@@ -147,9 +165,11 @@ void push_shack(CPUState *env, TCGv_ptr cpu_env, target_ulong next_eip)
     // prepare registers
     TCGv_ptr temp_shack_end = tcg_temp_local_new_ptr(); // store shack end
     TCGv_ptr temp_shack_top = tcg_temp_local_new_ptr(); // store shack top
+    TCGv temp_next_eip = tcg_temp_local_new(); // store eip
     // load common values
     tcg_gen_ld_ptr(temp_shack_end, cpu_env, offsetof(CPUState, shack_end));
     tcg_gen_ld_ptr(temp_shack_top, cpu_env, offsetof(CPUState, shack_top));
+    tcg_gen_mov_tl(temp_next_eip, tcg_const_tl(next_eip));
     // check shack full?
     tcg_gen_brcond_ptr(TCG_COND_NE,temp_shack_top,temp_shack_end,label_do_push); // if not full
     // flush here
@@ -158,34 +178,20 @@ void push_shack(CPUState *env, TCGv_ptr cpu_env, target_ulong next_eip)
     tcg_gen_ld_ptr(temp_shack_start, cpu_env, offsetof(CPUState, shack));
     tcg_gen_mov_tl(temp_shack_top, temp_shack_start);
     tcg_temp_free_ptr(temp_shack_start);
+    // call helper: flush the hash
+    gen_helper_shack_flush(cpu_env);
     // end of flush
     gen_set_label(label_do_push);
     // do push here
     // push guest eip
-    tcg_gen_st_ptr(tcg_const_tl(next_eip), temp_shack_top, 0); // store guest eip
+    tcg_gen_st_ptr(temp_next_eip, temp_shack_top, 0); // store guest eip
     tcg_gen_addi_ptr(temp_shack_top, temp_shack_top, sizeof(uint64_t)); // increase top
-    // push host addr slot
-    if(env->shadow_ret_count == SHACK_SIZE){
-        fprintf(stderr,"Max shadow_ret_count exceeds: %d, return to 0\n", env->shadow_ret_count);
-        env->shadow_ret_count = 0;
-    }
-    else{
-        //fprintf(stderr,"shadow_ret_count: %d\n", env->shadow_ret_count);
-    }
-    unsigned long *slot = &env->shadow_ret_addr[env->shadow_ret_count++];
-    tcg_gen_st_ptr(tcg_const_ptr((unsigned long)slot), temp_shack_top, sizeof(unsigned long)); // store host addr slot
-    tcg_gen_st_ptr(temp_shack_top, cpu_env, offsetof(CPUState, shack_top)); // store back top
-    // check if we need to translate this addr?
-    unsigned long host_eip = lookup_shadow_ret_addr(env, next_eip);
-    if(host_eip > 0){
-        // just add the result into slot
-        *slot = host_eip;
-    }
-    else{
-        // insert unresolved eip
-        insert_unresolved_eip(env, next_eip, slot);
-    }
+    // call helper: check if we can fill the ret directly, or need to add hash-pair
+    gen_helper_shack_push(cpu_env, temp_next_eip);
+    // store back top
+    tcg_gen_st_ptr(temp_shack_top, cpu_env, offsetof(CPUState, shack_top));
     // clean up
+    tcg_temp_free(temp_next_eip);
     tcg_temp_free_ptr(temp_shack_top);
     tcg_temp_free_ptr(temp_shack_end);
 }
@@ -217,6 +223,7 @@ void pop_shack(TCGv_ptr cpu_env, TCGv next_eip)
     tcg_gen_brcond_ptr(TCG_COND_NE,tcg_const_tl(next_eip),eip_on_shack,label_end); // go to "end" if not the same
     tcg_gen_ld_tl(host_slot_addr, temp_shack_top, sizeof(unsigned long)); // get slot addr
     tcg_gen_ld_ptr(host_addr, host_slot_addr, 0) ; // get host addr
+    tcg_gen_brcond_ptr(TCG_COND_EQ,tcg_const_tl(0),host_addr,label_end); // go to "end" if addr is zero
     // jump!
     *gen_opc_ptr++ = INDEX_op_jmp;
     *gen_opparam_ptr++ = GET_TCGV_I32(host_addr);
@@ -233,6 +240,7 @@ void pop_shack(TCGv_ptr cpu_env, TCGv next_eip)
  * Indirect Branch Target Cache
  */
 __thread int update_ibtc;
+static struct ibtc_table ibtc;
 
 /*
  * helper_lookup_ibtc()
@@ -241,6 +249,7 @@ __thread int update_ibtc;
  */
 void *helper_lookup_ibtc(target_ulong guest_eip)
 {
+
     return optimization_ret_addr;
 }
 
@@ -258,6 +267,7 @@ void update_ibtc_entry(TranslationBlock *tb)
  */
 static inline void ibtc_init(CPUState *env)
 {
+    memset(&ibtc, 0, sizeof(ibtc));
 }
 
 /*
