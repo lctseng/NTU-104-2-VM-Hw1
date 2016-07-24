@@ -202,6 +202,7 @@ void push_shack(CPUState *env, TCGv_ptr cpu_env, target_ulong next_eip)
  */
 void pop_shack(TCGv_ptr cpu_env, TCGv next_eip)
 {
+    
     // labels
     int label_end = gen_new_label();
     // prepare registers
@@ -241,6 +242,7 @@ void pop_shack(TCGv_ptr cpu_env, TCGv next_eip)
  */
 __thread int update_ibtc;
 static struct ibtc_table ibtc;
+static target_ulong last_guest_eip;
 
 /*
  * helper_lookup_ibtc()
@@ -249,8 +251,16 @@ static struct ibtc_table ibtc;
  */
 void *helper_lookup_ibtc(target_ulong guest_eip)
 {
-
-    return optimization_ret_addr;
+    int index;
+    last_guest_eip = guest_eip;
+    index = last_guest_eip & IBTC_CACHE_MASK;
+    void* addr = ibtc.htable[index].tb;
+    if(ibtc.htable[index].guest_eip == guest_eip && addr){
+        return addr;
+    }
+    else{
+        return optimization_ret_addr;
+    }
 }
 
 /*
@@ -259,6 +269,9 @@ void *helper_lookup_ibtc(target_ulong guest_eip)
  */
 void update_ibtc_entry(TranslationBlock *tb)
 {
+   int index = last_guest_eip & IBTC_CACHE_MASK;
+   ibtc.htable[index].guest_eip = last_guest_eip;
+   ibtc.htable[index].tb = tb;
 }
 
 /*
